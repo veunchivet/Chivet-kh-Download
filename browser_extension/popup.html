@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Chivet-kh Download</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <header>
+    <img src="icons/icon48.png" alt="" class="logo">
+    <div class="titles">
+      <div class="title">Chivet-kh Download</div>
+      <div id="status" class="status checking"><span class="dot"></span><span id="statusText">Checking…</span></div>
+    </div>
+    <label class="switch" title="Capture browser downloads">
+      <input type="checkbox" id="enabled">
+      <span class="slider"></span>
+    </label>
+  </header>
+
+  <section class="card">
+    <label class="check top"><input type="checkbox" id="showVideoButton"> Show “Download this video” button on videos</label>
+    <label class="check top"><input type="checkbox" id="showImageButton"> Show “Download this image” button on images</label>
+    <div class="sizer"><span>Button size</span><input type="range" id="buttonSize" min="70" max="160" step="5"><b id="buttonSizeVal">100%</b></div>
+    <label class="check top"><input type="checkbox" id="autoLaunch"> Start the app automatically when needed</label>
+    <div id="diag" class="diag"></div>
+    <div class="sep"></div>
+    <div class="label">Send a link</div>
+    <div class="row">
+      <input id="url" type="text" placeholder="https://… or paste a video page link">
+    </div>
+    <div class="row buttons">
+      <button id="sendLink" class="primary">Download</button>
+      <button id="sendPage" title="Send this tab to yt-dlp (YouTube, Facebook, TikTok…)">Grab video from this tab</button>
+    </div>
+    <div class="row buttons">
+      <button id="grabAll" class="grab">▦ Grab all files on this page</button>
+    </div>
+    <div class="row buttons">
+      <button id="allVideos" class="grab" title="Scrolls the page to load more, then lists every video link in Chivet-kh">▶▶ Download all videos on this page</button>
+    </div>
+    <div id="msg" class="msg"></div>
+  </section>
+
+  <details class="card">
+    <summary>Settings</summary>
+    <div class="grid">
+      <label for="port">App port</label>
+      <input id="port" type="number" min="1024" max="65535">
+      <label for="minSize">Skip files under (KB)</label>
+      <input id="minSize" type="number" min="0">
+    </div>
+    <label class="check"><input type="checkbox" id="captureAll"> Capture every download</label>
+    <label class="check"><input type="checkbox" id="sendCookies"> Send site cookies (logged-in downloads)</label>
+    <div class="label small">File types to capture</div>
+    <textarea id="exts" rows="3"></textarea>
+    <div class="row buttons">
+      <button id="save" class="primary">Save</button>
+      <button id="reset">Defaults</button>
+    </div>
+  </details>
+
+  <footer>Not running? Open the Chivet-kh Download app.<br>
+    Downloads go back to the browser automatically when the app is closed.</footer>
+  <script src="common.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>
