@@ -24,9 +24,20 @@ function shouldCapture(item, name, s) {
 
 async function updateBadge() {
   const s = await mdmSettings();
-  await chrome.action.setBadgeBackgroundColor({ color: s.enabled ? "#7c5cff" : "#64748b" });
-  await chrome.action.setBadgeText({ text: s.enabled ? "" : "OFF" });
+  if (!s.enabled) {
+    await chrome.action.setBadgeBackgroundColor({ color: "#64748b" });
+    return chrome.action.setBadgeText({ text: "OFF" });
+  }
+  const st = await mdmStatus();
+  let needs = st ? st.needs : 0;
+  if (st && mdmNewer(st.extension_version, chrome.runtime.getManifest().version)) needs += 1;
+  await chrome.action.setBadgeBackgroundColor({ color: needs ? "#f59e0b" : "#7c5cff" });
+  await chrome.action.setBadgeText({ text: needs ? "!" : "" });
+  await chrome.action.setTitle({ title: needs ? `Chivet-kh Download — ${needs} update${needs > 1 ? "s" : ""} ready (click)` : "Chivet-kh Download" });
 }
+
+chrome.alarms.create("mdm-status", { periodInMinutes: 30 });
+chrome.alarms.onAlarm.addListener(a => { if (a.name === "mdm-status") updateBadge(); });
 
 function notify(title, message) {
   chrome.notifications.create({
@@ -369,8 +380,35 @@ async function mdmCollectVideoLinks(scrolls) {
   return { page: location.href, title: document.title, links: [...found.entries()].map(([url, text]) => ({ url, text })) };
 }
 
+// 红果短剧: the page script clicks through the episode list and returns each free episode's file
+const HG_RX = /^https?:\/\/([\w-]+\.)*hongguoduanju\.com\//i;
+async function postLinks(data) {
+  const s = await mdmSettings();
+  const origins = [...new Set(data.links.map(l => { try { return new URL(l.url).origin; } catch (e) { return ""; } }))].filter(Boolean);
+  const cookies = {};
+  if (s.sendCookies) for (const o of origins.slice(0, 10)) { const c = await mdmCookieHeader(o + "/"); if (c) cookies[o] = c; }
+  try {
+    const r = await fetch(`${mdmBase(s.port)}/add-links`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-MDM-Client": "extension" },
+      body: JSON.stringify({ ...data, cookies, userAgent: navigator.userAgent })
+    });
+    return { ok: r.ok, count: data.links.length };
+  } catch (e) {
+    return { ok: false, reason: "offline" };
+  }
+}
+
 async function collectLinks(tabId, scrolls) {
   if (!(await mdmEnsureApp(tabId))) return { ok: false, reason: "offline" };
+  let tab = null;
+  try { tab = await chrome.tabs.get(tabId); } catch (e) {}
+  if (tab && HG_RX.test(tab.url || "")) {
+    let res = null;
+    try { res = await chrome.tabs.sendMessage(tabId, { type: "mdm-hg-episodes" }, { frameId: 0 }); } catch (e) {}
+    if (!res || !res.links || !res.links.length) return { ok: false, reason: "none" };
+    return postLinks({ page: tab.url, title: res.title || tab.title, links: res.links, episodes: true, skipped: res.skipped || 0 });
+  }
   let res;
   try {
     [res] = await chrome.scripting.executeScript({ target: { tabId }, func: mdmCollectVideoLinks, args: [scrolls] });
@@ -402,7 +440,8 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
   (async () => {
     const s = await mdmSettings();
     if (msg && msg.type === "send") {
-      if (!(await mdmEnsureApp(sender.tab ? sender.tab.id : null))) return reply({ ok: false, reason: "offline" });
+      const ready = msg.noLaunch ? !!(await mdmPing(s.port)) : await mdmEnsureApp(sender.tab ? sender.tab.id : null);
+      if (!ready) return reply({ ok: false, reason: "offline", autoLaunch: s.autoLaunch });
       const payload = { url: msg.url, mode: msg.mode || "auto", source: msg.source || (sender.tab ? "video-button" : "popup") };
       for (const k of ["referrer", "quality", "filename", "title"]) if (msg[k]) payload[k] = String(msg[k]);
       if (msg.lookup) payload.lookup = true;
@@ -415,9 +454,25 @@ chrome.runtime.onMessage.addListener((msg, sender, reply) => {
       const tabId = sender.tab ? sender.tab.id : -1;
       const since = pageStart(tabId);
       reply({ streams: tabId >= 0 ? (await getStreams(tabId)).filter(x => x.ts >= since) : [] });
+    } else if (msg && msg.type === "waitApp") {
+      const end = Date.now() + Math.min(60000, msg.ms || 30000);
+      let ok = false;
+      while (Date.now() < end) {
+        if (await mdmPing(s.port, 700)) { ok = true; break; }
+        await new Promise(r => setTimeout(r, 600));
+      }
+      if (ok) await new Promise(r => setTimeout(r, 500));
+      reply({ ok });
     } else if (msg && msg.type === "links") {
       const tabId = msg.tabId || (sender.tab && sender.tab.id);
       reply(tabId ? await collectLinks(tabId, msg.scrolls == null ? 15 : msg.scrolls) : { ok: false });
+    } else if (msg && msg.type === "episodes") {
+      const tabId = sender.tab ? sender.tab.id : null;
+      if (!(await mdmEnsureApp(tabId))) return reply({ ok: false, reason: "offline" });
+      const links = (msg.links || []).filter(l => l && /^https?:/i.test(l.url)).slice(0, 2000);
+      if (!links.length) return reply({ ok: false, reason: "none" });
+      reply(await postLinks({ page: msg.page || (sender.tab && sender.tab.url) || "", title: String(msg.title || ""),
+                              links, episodes: true, skipped: +msg.skipped || 0 }));
     } else if (msg && msg.type === "fbid") {
       reply({ id: sender.tab ? currentFbId(sender.tab.id) : "" });
     } else if (msg && msg.type === "grab") {

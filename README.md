@@ -15,6 +15,7 @@ Built with Python + PyQt6, yt-dlp and ffmpeg.
 - **Grab all files on this page** — every image, video, audio, document, archive and program on a page, filter by type and tick what you want
 - **Browser capture** — zip, exe, pdf, mp4… downloads started in Chrome go to Chivet-kh Download automatically
 - **Download links** — paste many Reel / video / playlist / channel / page links; every video inside them is listed and downloaded (quality, MP3, subtitles for all at once)
+- **红果短剧 (hongguoduanju.com)** — built-in reader: *Download this episode* on the playing video, or *▾ → Download all free episodes* (clicks through the episode list; locked / VIP episodes are skipped, nothing is unlocked)
 - **Download all videos on this page** — the extension scrolls a page (e.g. a Facebook page's Reels tab, a YouTube channel, a TikTok profile), collects every video link and sends them to *Download links*
 - **Subtitles** — choose a language or *All languages*, put them into the video, or download *Subtitles only (.srt)*
 - **Button size** — make the video/image button smaller or bigger in the extension popup
@@ -48,7 +49,11 @@ Download the latest **ChivetKhDownload.zip** from [Releases](../../releases), un
 
 Chivet-kh Download starts with Windows (hidden in the tray). If it is closed, clicking a download button starts it automatically — the first time Chrome asks *"Open Chivet-kh Download?"*: tick **Always allow** and click **Open**.
 
-If a site stops working, open **Helpers… → Update yt-dlp** in the *Download video from a page* window.
+**One-click updates:** when something needs installing or updating (Deno, yt-dlp, ffmpeg, a new Chivet-kh version, the extension), the extension icon shows an orange **!** — open it and press **Install** / **Update**. The app downloads it, installs it and restarts by itself.
+
+**YouTube** needs a small free helper called **Deno**: the app offers to install it the first time (or *Helpers… → Install Deno*).
+
+If a site stops working, open **Helpers… → Update yt-dlp** (works in the .exe too) in the *Download video from a page* window.
 
 ## Build the .exe yourself
 
@@ -88,7 +93,10 @@ Double-click **`build_exe.bat`** → the result is in `dist\ChivetKhDownload\` (
 - **ឯកសារធម្មតា** (zip, exe, pdf…)៖ ចុចទាញក្នុង Chrome ធម្មតា វាមកក្នុងកម្មវិធីដោយខ្លួនឯង
 - ឯកសារទាំងអស់នៅក្នុង `Downloads\ChivetKhDownload\`
 - កម្មវិធីបើកដោយខ្លួនឯងពេលបើកកុំព្យូទ័រ (លាក់ក្នុង tray)។ បើវាបិទ ចុចប៊ូតុងទាញ វានឹងបើកកម្មវិធីឲ្យ — លើកដំបូង Chrome សួរ *"Open Chivet-kh Download?"* → ធីក **Always allow** → ចុច **Open**
-- បើទាញពី Facebook/YouTube មិនបាន៖ **Helpers… → Update yt-dlp**
+- **Update ចុចតែម្ដង៖** ពេលមានអ្វីត្រូវដំឡើង ឬ Update (Deno, yt-dlp, ffmpeg, version ថ្មី, extension) រូប extension បង្ហាញ **!** ពណ៌ទឹកក្រូច → ចុចរូប extension → ចុច **Install** / **Update** → កម្មវិធីទាញ ដំឡើង និងបិទបើកឡើងវិញដោយខ្លួនឯង
+- **YouTube** ត្រូវការកម្មវិធីជំនួយ **Deno** (ឥតគិតថ្លៃ)៖ កម្មវិធីនឹងសួរដំឡើងឲ្យលើកដំបូង ឬ **Helpers… → Install Deno**
+- **红果短剧**៖ បើកភាគនៅ Chrome ឲ្យវាចាក់ → ចុចប៊ូតុង *Download this episode* ឬ **▾ → Download all free episodes** ដើម្បីទាញគ្រប់ភាគឥតគិតថ្លៃ (ភាគជាប់សោ/VIP រំលង)
+- បើទាញពី Facebook/YouTube មិនបាន៖ **Helpers… → Update yt-dlp** ហើយបិទបើកកម្មវិធីឡើងវិញ
 
 ### ចំណាំ
 - វីដេអូដែលមាន DRM (Netflix, Disney+…) មិនអាចទាញបានទេ

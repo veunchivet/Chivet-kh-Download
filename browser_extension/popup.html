@@ -10,7 +10,8 @@
     <img src="icons/icon48.png" alt="" class="logo">
     <div class="titles">
       <div class="title">Chivet-kh Download</div>
-      <div id="status" class="status checking"><span class="dot"></span><span id="statusText">Checking…</span></div>
+      <div id="status" class="status checking"><span class="dot"></span><span id="statusText">Checking…</span>
+        <button id="startApp" class="mini" style="display:none">▶ Start app</button></div>
     </div>
     <label class="switch" title="Capture browser downloads">
       <input type="checkbox" id="enabled">
@@ -40,6 +41,12 @@
       <button id="allVideos" class="grab" title="Scrolls the page to load more, then lists every video link in Chivet-kh">▶▶ Download all videos on this page</button>
     </div>
     <div id="msg" class="msg"></div>
+  </section>
+
+  <section class="card" id="updCard" style="display:none">
+    <div class="label">Updates &amp; helpers <span id="updCount" class="pill"></span></div>
+    <div id="updList"></div>
+    <div class="upd-foot"><button id="updCheck" class="mini">↻ Check now</button><span id="updNote"></span></div>
   </section>
 
   <details class="card">

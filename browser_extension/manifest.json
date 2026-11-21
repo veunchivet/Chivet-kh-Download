@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Chivet-kh Download",
   "short_name": "Chivet-kh",
-  "version": "1.7.0",
+  "version": "1.9.2",
   "description": "Send browser downloads, links and videos to the Chivet-kh Download desktop app.",
   "permissions": [
     "downloads",
@@ -11,7 +11,8 @@
     "cookies",
     "notifications",
     "webRequest",
-    "scripting"
+    "scripting",
+    "alarms"
   ],
   "host_permissions": [
     "<all_urls>"

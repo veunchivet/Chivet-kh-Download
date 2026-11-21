@@ -67,6 +67,37 @@ async function mdmEnsureApp(tabId, waitMs = 25000) {
   return ok;
 }
 
+async function mdmStatus() {
+  const s = await mdmSettings();
+  try {
+    const r = await fetch(`${mdmBase(s.port)}/status`, { headers: { "X-MDM-Client": "extension" }, cache: "no-store" });
+    return r.ok ? await r.json() : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function mdmPost(path, body) {
+  const s = await mdmSettings();
+  try {
+    const r = await fetch(`${mdmBase(s.port)}${path}`, {
+      method: "POST", headers: { "Content-Type": "application/json", "X-MDM-Client": "extension" },
+      body: JSON.stringify(body || {})
+    });
+    return r.ok ? await r.json() : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function mdmNewer(a, b) {   // is version a newer than b?
+  const pa = String(a || "").split(/\D+/).filter(Boolean).map(Number), pb = String(b || "").split(/\D+/).filter(Boolean).map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    if ((pa[i] || 0) !== (pb[i] || 0)) return (pa[i] || 0) > (pb[i] || 0);
+  }
+  return false;
+}
+
 async function mdmCookieHeader(url) {
   try {
     const list = await chrome.cookies.getAll({ url });

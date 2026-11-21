@@ -11,6 +11,7 @@ async function refreshStatus() {
   const ok = !!(await mdmPing(s.port));
   $("status").className = "status " + (ok ? "ok" : "off");
   $("statusText").textContent = ok ? `Connected · port ${s.port}` : "App not running";
+  $("startApp").style.display = ok ? "none" : "";
   return ok;
 }
 
@@ -33,7 +34,77 @@ async function load() {
   } catch (e) {}
   await refreshStatus();
   await checkTab();
+  if (await refreshUpdates()) pollUpdates();
 }
+
+// ---------------- Updates & helpers: one click → the app downloads and installs it
+let updTimer = 0;
+async function refreshUpdates() {
+  const card = $("updCard"), list = $("updList");
+  const st = await mdmStatus();
+  if (!st) { card.style.display = "none"; return; }
+  const rows = [];
+  const mine = chrome.runtime.getManifest().version;
+  if (mdmNewer(st.extension_version, mine)) {
+    rows.push({ id: "ext", name: "Browser extension", why: `Version ${st.extension_version} is ready (you have ${mine})`,
+                need: true, action: "reload" });
+  }
+  if (st.restart_needed) rows.push({ id: "restart", name: "Restart Chivet-kh Download", why: "Finishes the last update", need: true, action: "restart" });
+  for (const c of st.components) rows.push(c);
+  const needs = rows.filter(r => r.need || r.state === "running" || r.state === "error" || r.state === "done");
+  card.style.display = "";
+  $("updCount").textContent = rows.filter(r => r.need).length || "";
+  $("updCount").style.display = rows.some(r => r.need) ? "" : "none";
+  list.innerHTML = "";
+  const show = needs.length ? needs : [{ id: "all", name: "Everything is up to date", why: `App ${st.version} · yt-dlp ${(st.components.find(c => c.id === "ytdlp") || {}).version || ""}`, ok: true }];
+  for (const r of show) {
+    const row = document.createElement("div");
+    row.className = "upd";
+    const info = document.createElement("div");
+    info.className = "info";
+    info.innerHTML = `<div class="nm"></div><div class="why"></div>`;
+    info.querySelector(".nm").textContent = r.name + (r.latest && r.need ? `  →  ${r.latest}` : "");
+    const why = info.querySelector(".why");
+    why.textContent = r.state === "running" ? (r.msg || "Working…") : r.state === "error" ? "✖ " + r.msg : r.state === "done" ? r.msg : r.why;
+    if (r.state === "error") why.classList.add("err");
+    if (r.state === "running") info.insertAdjacentHTML("beforeend", `<div class="bar"><i style="width:${r.pct || 3}%"></i></div>`);
+    row.appendChild(info);
+    if (r.ok || (r.state === "done" && !r.need)) {
+      const ok = document.createElement("span"); ok.className = "ok"; ok.textContent = "✓"; row.appendChild(ok);
+    } else if (r.need && r.state !== "running") {
+      const b = document.createElement("button");
+      b.className = "primary";
+      b.textContent = r.action === "update" ? "Update" : r.action === "reload" ? "Reload" : r.action === "restart" ? "Restart" : r.state === "error" ? "Retry" : "Install";
+      b.onclick = async () => {
+        b.disabled = true; b.textContent = "…";
+        if (r.action === "reload") { chrome.runtime.reload(); return; }
+        if (r.action === "restart") await mdmPost("/restart");
+        else await mdmPost("/install", { id: r.id });
+        pollUpdates();
+      };
+      row.appendChild(b);
+    }
+    list.appendChild(row);
+  }
+  $("updNote").textContent = "";
+  chrome.runtime.sendMessage({ type: "badge" });
+  return rows.some(r => r.state === "running") || st.restart_needed;
+}
+
+function pollUpdates() {
+  clearTimeout(updTimer);
+  updTimer = setTimeout(async () => {
+    const busy = await refreshUpdates().catch(() => false);
+    if (busy) pollUpdates();
+    else if (!(await mdmStatus())) { $("updNote").textContent = "Restarting the app…"; pollUpdates(); }
+  }, 1000);
+}
+
+$("updCheck").addEventListener("click", async () => {
+  $("updNote").textContent = "Checking GitHub…";
+  await mdmPost("/check-updates");
+  setTimeout(refreshUpdates, 2500);
+});
 
 // Is the video button running on this tab? Offer a fix when it is not.
 async function checkTab() {
@@ -90,6 +161,18 @@ $("enabled").addEventListener("change", async (e) => {
   await chrome.storage.local.set({ enabled: e.target.checked });
   chrome.runtime.sendMessage({ type: "badge" });
   setMsg(e.target.checked ? "Capturing browser downloads." : "Browser downloads stay in the browser.");
+});
+
+$("startApp").addEventListener("click", async () => {
+  const a = document.createElement("a");
+  a.href = "chivetkh://start";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  $("statusText").textContent = "Starting…";
+  const r = await chrome.runtime.sendMessage({ type: "waitApp", ms: 30000 });
+  await refreshStatus();
+  setMsg(r && r.ok ? "Chivet-kh Download is running ✓" : "Could not start it — open the app once from its folder.", r && r.ok ? "ok" : "err");
 });
 
 $("showVideoButton").addEventListener("change", async (e) => {

@@ -20,6 +20,7 @@ import os
 import re
 import sys
 import json
+import html as html_mod
 import time
 import uuid
 import shutil
@@ -36,7 +37,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import requests
 from PyQt6.QtCore import (Qt, QTimer, QObject, pyqtSignal, QAbstractTableModel, QModelIndex,
                           QSize, QByteArray, QTime, QUrl, QRectF, QItemSelectionModel)
-from PyQt6.QtGui import (QIcon, QPixmap, QPainter, QColor, QAction, QDesktopServices, QFont,
+from PyQt6.QtGui import (QShortcut, QIcon, QPixmap, QPainter, QColor, QAction, QDesktopServices, QFont,
                          QLinearGradient, QKeySequence, QGuiApplication, QPainterPath, QPen)
 from PyQt6.QtWidgets import (QPlainTextEdit, QTabWidget, QProgressBar, QTableWidget, QTableWidgetItem, QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QGridLayout, QFormLayout, QLabel, QLineEdit, QPushButton, QToolButton,
@@ -47,12 +48,24 @@ from PyQt6.QtWidgets import (QPlainTextEdit, QTabWidget, QProgressBar, QTableWid
                              QToolBar, QGroupBox, QTextBrowser, QSizePolicy)
 from PyQt6.QtSvg import QSvgRenderer
 
+TOOLS_DIR = Path.home() / ".chivet_kh_download" / "tools"
+YTDLP_OVERRIDE = TOOLS_DIR / "yt-dlp.pyz"   # newer yt-dlp downloaded by Helpers → Update yt-dlp (exe builds)
+if getattr(sys, "frozen", False) and YTDLP_OVERRIDE.is_file():
+    sys.path.insert(0, str(YTDLP_OVERRIDE))
 try:
     import yt_dlp
     HAS_YTDLP = True
 except Exception:
-    yt_dlp = None
-    HAS_YTDLP = False
+    if str(YTDLP_OVERRIDE) in sys.path:     # broken download → fall back to the bundled copy
+        sys.path.remove(str(YTDLP_OVERRIDE))
+        for _m in [m for m in sys.modules if m == "yt_dlp" or m.startswith("yt_dlp.")]:
+            del sys.modules[_m]
+    try:
+        import yt_dlp
+        HAS_YTDLP = True
+    except Exception:
+        yt_dlp = None
+        HAS_YTDLP = False
 
 try:
     import libtorrent as lt
@@ -63,7 +76,7 @@ except Exception:
 
 APP_NAME = "Chivet-kh Download"
 APP_SHORT = "ChivetKhDownload"
-VERSION = "1.7.0"
+VERSION = "1.9.2"
 DATA_DIR = Path.home() / ".chivet_kh_download"
 # carry settings + download list over from the earlier builds (Chivet IDM, Mister DM)
 for _old in (Path.home() / ".chivet_idm", Path.home() / ".mister_dm"):
@@ -75,6 +88,7 @@ for _old in (Path.home() / ".chivet_idm", Path.home() / ".mister_dm"):
 DOWNLOADS_FILE = DATA_DIR / "downloads.json"
 SETTINGS_FILE = DATA_DIR / "settings.json"
 DEFAULT_PORT = 17890
+GITHUB_REPO = "veunchivet/Chivet-kh-Download"
 DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/130.0 Safari/537.36")
 
@@ -397,6 +411,9 @@ def find_ffmpeg(settings: dict = None):
     p = (settings or {}).get("ffmpeg_path") or ""
     if p and os.path.isfile(p):
         return p
+    own = TOOLS_DIR / ("ffmpeg.exe" if os.name == "nt" else "ffmpeg")
+    if own.is_file():
+        return str(own)
     if not _FFMPEG_AUTO:
         found = shutil.which("ffmpeg")
         if not found:
@@ -407,6 +424,210 @@ def find_ffmpeg(settings: dict = None):
                 found = None
         _FFMPEG_AUTO.append(found)
     return _FFMPEG_AUTO[0]
+
+
+def find_deno():
+    p = TOOLS_DIR / ("deno.exe" if os.name == "nt" else "deno")
+    if p.is_file():
+        return str(p)
+    return shutil.which("deno")
+
+
+def ytdlp_base_opts() -> dict:
+    """Options every yt-dlp call needs for YouTube: a JavaScript runtime + the EJS solver."""
+    runtimes = {}
+    deno = find_deno()
+    if deno:
+        runtimes["deno"] = {"path": deno}
+    node = shutil.which("node")
+    if node:
+        runtimes["node"] = {"path": node}
+    opts = {"remote_components": ["ejs:github"]}
+    if runtimes:
+        opts["js_runtimes"] = runtimes
+    return opts
+
+
+def is_youtube(url: str) -> bool:
+    host = urllib.parse.urlparse(url or "").netloc.lower()
+    return any(host == d or host.endswith("." + d) for d in ("youtube.com", "youtu.be", "youtube-nocookie.com"))
+
+
+def clean_video_url(url: str) -> str:
+    """youtube.com/watch?v=ID&list=RD…&start_radio=1 → youtube.com/watch?v=ID (one video, not the mix)."""
+    try:
+        u = urllib.parse.urlparse(url)
+        if is_youtube(url) and u.path == "/watch":
+            v = urllib.parse.parse_qs(u.query).get("v", [""])[0]
+            if v:
+                return f"https://www.youtube.com/watch?v={v}"
+    except Exception:
+        pass
+    return url
+
+
+def ytdlp_headers(headers: dict, url: str) -> dict:
+    """Headers for yt-dlp. YouTube refuses browser cookies sent this way ("The page needs to be reloaded")."""
+    h = {"User-Agent": (headers or {}).get("User-Agent") or DEFAULT_UA}
+    for k in ("Cookie", "Referer"):
+        if (headers or {}).get(k) and not (k == "Cookie" and is_youtube(url)):
+            h[k] = headers[k]
+    return h
+
+
+def clean_error(e) -> str:
+    return re.sub(r"\x1b\[[0-9;]*m", "", str(e)).replace("ERROR: ", "").strip()
+
+
+def ytdlp_extract(url: str, opts: dict, headers: dict, download: bool = False, no_retry=None):
+    """extract_info with the right options; retried once without cookies if the site rejects them."""
+    h = ytdlp_headers(headers, url)
+    full = {**ytdlp_base_opts(), **opts, "http_headers": h}
+    try:
+        with yt_dlp.YoutubeDL(full) as ydl:
+            info = ydl.extract_info(url, download=download)
+            return ydl, info
+    except Exception as e:
+        if "Cookie" not in h or "StopDownload" in repr(e) or (no_retry and no_retry(e)):
+            raise
+        h2 = {k: v for k, v in h.items() if k != "Cookie"}
+        with yt_dlp.YoutubeDL({**full, "http_headers": h2}) as ydl:
+            info = ydl.extract_info(url, download=download)
+            return ydl, info
+
+
+# ---------------------------------------------------------------------------
+# Built-in readers for sites yt-dlp does not know (direct MP4 files only — no DRM, nothing locked)
+# ---------------------------------------------------------------------------
+HONGGUO_HOST = re.compile(r"(^|\.)hongguoduanju\.com$", re.I)
+HONGGUO_MP4 = re.compile(r"(https?:)?(//[\w.-]+)?/video/public/(\d{6,})/(\d{3,4})p\.mp4", re.I)
+HONGGUO_QUALITIES = (1080, 720, 540, 480, 360)
+
+
+def _host(url: str) -> str:
+    try:
+        return urllib.parse.urlparse(url or "").netloc.lower().split(":")[0]
+    except Exception:
+        return ""
+
+
+def is_hongguo(url: str, referer: str = "") -> bool:
+    """红果短剧 player / detail page, or one of its video files (the button sends the file + the page as Referer)."""
+    if HONGGUO_HOST.search(_host(url)):
+        return True
+    return bool(referer and HONGGUO_HOST.search(_host(referer)) and
+                re.search(r"\.mp4(\?|$)", urllib.parse.urlparse(url).path + "?", re.I))
+
+
+def _hg_title(text: str) -> str:
+    t = re.sub(r"\s*\|\s*全集在线免费观看.*$", "", text or "").strip()
+    t = re.sub(r"\s*[|｜-]\s*红果短剧\s*$", "", t).strip()
+    return t
+
+
+def _probe_size(url: str, headers: dict) -> int:
+    """Size of a file if the server sends it (0 = missing / refused)."""
+    try:
+        with requests.get(url, headers={**headers, "Range": "bytes=0-0"}, stream=True, timeout=10,
+                          allow_redirects=True) as r:
+            if r.status_code not in (200, 206):
+                return 0
+            ctype = r.headers.get("Content-Type", "")
+            if ctype and not ctype.startswith(("video/", "application/octet-stream", "binary/")):
+                return 0
+            m = re.search(r"/(\d+)\s*$", r.headers.get("Content-Range", ""))
+            return int(m.group(1)) if m else int(r.headers.get("Content-Length") or 1)
+    except Exception:
+        return 0
+
+
+def hongguo_extract(url: str, headers: dict = None, title_hint: str = "") -> dict:
+    """Read one 红果短剧 episode. Returns a yt-dlp-like info dict whose formats are direct MP4 links."""
+    headers = dict(headers or {})
+    ua = headers.get("User-Agent") or DEFAULT_UA
+    page = url if HONGGUO_HOST.search(_host(url)) and "/video/public/" not in url else (headers.get("Referer") or "")
+    base_h = {"User-Agent": ua, "Referer": page or "https://hongguoduanju.com/"}
+    title, thumb, found, episodes = title_hint, "", [], []
+    if "/video/public/" in url or not HONGGUO_HOST.search(_host(url)):
+        found.append(url)   # the file itself (sent by the browser button)
+    else:
+        r = requests.get(url, headers={"User-Agent": ua, "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.6"}, timeout=20)
+        r.raise_for_status()
+        html = r.text
+        m = re.search(r"<title[^>]*>(.*?)</title>", html, re.S | re.I)
+        if m and not title_hint:
+            title = _hg_title(html_mod.unescape(m.group(1)))
+        m = re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)', html, re.I)
+        thumb = m.group(1) if m else ""
+        for mm in HONGGUO_MP4.finditer(html.replace("\\u002F", "/").replace("\\/", "/")):
+            u = mm.group(0)
+            u = ("https:" + u) if u.startswith("//") else u if u.startswith("http") else "https://hongguoduanju.com" + u
+            if u not in found:
+                found.append(u)
+        sid = re.search(r"/player/(\d{6,})", url) or re.search(r"series_id=(\d{6,})", url)
+        if sid:
+            for mm in re.finditer(r"/player/%s/(\d{6,})" % sid.group(1), html):
+                e = f"https://hongguoduanju.com/player/{sid.group(1)}/{mm.group(1)}"
+                if e not in episodes:
+                    episodes.append(e)
+    if not found:
+        raise RuntimeError("No free video file on this page. Open the episode in the browser and press "
+                           "the Chivet-kh button on the playing video (locked / VIP episodes cannot be downloaded).")
+    formats, seen = [], set()
+    mm = HONGGUO_MP4.search(found[0])
+    if mm:   # same video in other sizes: …/video/public/<id>/720p.mp4
+        root = found[0][:mm.start(4)]
+        tail = found[0][mm.end(4) + 1:]
+        cands = [(q, f"{root}{q}p{tail}") for q in HONGGUO_QUALITIES]
+        if not any(c[1] == found[0] for c in cands):
+            cands.append((int(mm.group(4)), found[0]))
+    else:
+        q = re.search(r"(\d{3,4})p", found[0])
+        cands = [(int(q.group(1)) if q else 0, found[0])]
+    for q, u in cands:
+        if u in seen:
+            continue
+        seen.add(u)
+        size = _probe_size(u, base_h)
+        if size or u == found[0]:
+            formats.append({"format_id": f"{q}p" if q else "mp4", "url": u, "height": q or None, "ext": "mp4",
+                            "vcodec": "h264", "acodec": "aac", "filesize": size if size > 1 else None})
+    title = title or "红果短剧"
+    return {"extractor_key": "Hongguo", "title": title, "thumbnail": thumb, "formats": formats,
+            "webpage_url": page or url, "http_headers": base_h, "_direct": True, "_episodes": episodes}
+
+
+def builtin_extract(url: str, headers: dict = None, title_hint: str = ""):
+    """Info dict for a site that has a built-in reader, else None (→ use yt-dlp)."""
+    if is_hongguo(url, (headers or {}).get("Referer", "")):
+        return hongguo_extract(url, headers, title_hint)
+    return None
+
+
+def direct_options(info: dict, has_ff: bool) -> list:
+    """Rows for VideoPageDialog when the formats are plain files (built-in readers)."""
+    opts = []
+    for f in sorted(info.get("formats") or [], key=lambda f: -(f.get("height") or 0)):
+        label = (f"{f['height']}p MP4" if f.get("height") else "MP4 file")
+        opts.append(dict(kind="video", label=label, selector="", ext="mp4", size=f.get("filesize"), approx=False,
+                         direct_url=f["url"]))
+    if has_ff and opts:
+        best = opts[0]["direct_url"]
+        for q, label, _k in MP3_CHOICES[:1] + MP3_CHOICES[3:4]:
+            opts.append(dict(kind="mp3", label=f"Audio only MP3 {label}", selector="ba/b", ext="mp3", size=None,
+                             approx=True, mp3q=q, direct_url=best))
+    return opts
+
+
+def pick_direct(info: dict, quality: str) -> dict:
+    """Best format for a LINK_QUALITIES key ('best', '1080', '720', '480', 'audio')."""
+    fmts = sorted(info.get("formats") or [], key=lambda f: -(f.get("height") or 0))
+    if not fmts:
+        return {}
+    if quality and quality.isdigit():
+        under = [f for f in fmts if (f.get("height") or 0) <= int(quality)]
+        return under[0] if under else fmts[-1]
+    return fmts[0]
 
 
 def looks_like_url(text: str) -> bool:
@@ -564,6 +785,7 @@ class Bridge(QObject):
     lookup_result = pyqtSignal(int, object)
     batch_add = pyqtSignal(dict)
     links_add = pyqtSignal(dict)
+    quit_request = pyqtSignal()
     links_result = pyqtSignal(int, int, object)
     thumb_result = pyqtSignal(int, bytes)
 
@@ -859,12 +1081,7 @@ class YtdlpTask(BaseTask):
             "outtmpl": outtmpl,
             "format": fmt, "noplaylist": True, "quiet": True, "no_warnings": True,
             "continuedl": True, "progress_hooks": [hook], "windowsfilenames": True, "logger": _QuietLogger(),
-            "http_headers": {"User-Agent": it.headers.get("User-Agent") or DEFAULT_UA},
         }
-        if it.headers.get("Cookie"):
-            opts["http_headers"]["Cookie"] = it.headers["Cookie"]
-        if it.headers.get("Referer"):
-            opts["http_headers"]["Referer"] = it.headers["Referer"]
         audio_only = bool(it.audio_format) or q == "audio" or fmt.startswith("ba")
         pps = []
         if ff:
@@ -894,15 +1111,15 @@ class YtdlpTask(BaseTask):
         if limits:
             opts["ratelimit"] = min(limits) * 1024
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(it.url, download=True)
-                path = ""
-                if info:
-                    reqs = info.get("requested_downloads") or []
-                    if reqs:
-                        path = reqs[0].get("filepath") or reqs[0].get("_filename") or ""
-                    if not path:
-                        path = ydl.prepare_filename(info)
+            ydl, info = ytdlp_extract(clean_video_url(it.url), opts, it.headers, download=True,
+                                      no_retry=lambda e: self.stop_event.is_set())
+            path = ""
+            if info:
+                reqs = info.get("requested_downloads") or []
+                if reqs:
+                    path = reqs[0].get("filepath") or reqs[0].get("_filename") or ""
+                if not path:
+                    path = ydl.prepare_filename(info)
             if subs_only:
                 files = [v.get("filepath") for v in ((info or {}).get("requested_subtitles") or {}).values() if v.get("filepath")]
                 files = [f for f in files if f and os.path.exists(f)]
@@ -925,8 +1142,10 @@ class YtdlpTask(BaseTask):
             if self.stop_event.is_set() or isinstance(e, StopDownload) or "StopDownload" in repr(e):
                 self.bridge.task_done.emit(it.id, "stopped", "")
             else:
-                msg = re.sub(r"\x1b\[[0-9;]*m", "", str(e))
-                self.bridge.task_done.emit(it.id, "error", msg.replace("ERROR: ", "")[:300])
+                msg = clean_error(e)
+                if is_youtube(it.url) and not find_deno():
+                    msg += "  —  YouTube needs Deno: Helpers… → Install Deno"
+                self.bridge.task_done.emit(it.id, "error", msg[:400])
 
 
 class TorrentTask(BaseTask):
@@ -987,6 +1206,8 @@ class TorrentTask(BaseTask):
             self.bridge.task_done.emit(it.id, "finished", "")
 
 
+INSTALLER = None   # created by MainWindow
+
 # Registry used by unique_name() to avoid clashes with not-yet-finished downloads
 _ITEM_REGISTRY = {}
 
@@ -1041,6 +1262,8 @@ class ApiHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path.startswith("/ping") and self._allowed():
             return self._json(200, {"ok": True, "app": APP_SHORT, "version": VERSION})
+        if self.path.startswith("/status") and self._allowed() and INSTALLER:
+            return self._json(200, INSTALLER.status())
         self._json(403, {"ok": False})
 
     def do_POST(self):
@@ -1069,6 +1292,18 @@ class ApiHandler(BaseHTTPRequestHandler):
                 return self._json(400, {"ok": False, "error": "no items"})
             self.bridge.batch_add.emit(data)
             return self._json(200, {"ok": True, "count": len(data["items"])})
+        if self.path == "/quit":
+            self.bridge.quit_request.emit()
+            return self._json(200, {"ok": True})
+        if self.path == "/install" and INSTALLER:
+            ok = INSTALLER.start(str(data.get("id", "")))
+            return self._json(200, {"ok": ok})
+        if self.path == "/check-updates" and INSTALLER:
+            INSTALLER.check_latest(force=True)
+            return self._json(200, {"ok": True})
+        if self.path == "/restart" and INSTALLER:
+            INSTALLER.restart_wanted.emit()
+            return self._json(200, {"ok": True})
         if self.path == "/show":
             self.bridge.show_window.emit()
             return self._json(200, {"ok": True})
@@ -1160,8 +1395,80 @@ def register_protocol():
         pass
 
 
+def autostart_status() -> str:
+    if platform.system() != "Windows":
+        return "Only on Windows"
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            val, _ = winreg.QueryValueEx(k, RUN_NAME)
+    except FileNotFoundError:
+        return "✖ Not registered"
+    except Exception as e:
+        return f"✖ {e}"
+    approved = ""
+    try:  # Windows "Startup apps" switch (Task Manager / Settings) stores off-switches here
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                            r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run") as k:
+            data, _ = winreg.QueryValueEx(k, RUN_NAME)
+            if data and data[0] in (3, 7):
+                approved = "  ·  ✖ turned OFF in Windows Startup apps"
+    except Exception:
+        pass
+    return ("✔ " if not approved else "") + val + approved
+
+
+def log_start(note: str):
+    try:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(DATA_DIR / "startup.log", "a", encoding="utf-8") as f:
+            f.write(f"{datetime.now():%Y-%m-%d %H:%M:%S}  {note}  argv={sys.argv[1:]}\n")
+    except Exception:
+        pass
+
+
 def started_in_background() -> bool:
-    return "--minimized" in sys.argv or any(a.lower().startswith(PROTOCOL + ":") for a in sys.argv[1:])
+    return "--minimized" in sys.argv or "--restart" in sys.argv or any(a.lower().startswith(PROTOCOL + ":") for a in sys.argv[1:])
+
+
+def running_version(port: int):
+    """Version of the copy already running on this computer, or None."""
+    try:
+        r = requests.get(f"http://127.0.0.1:{port}/ping", headers={"X-MDM-Client": "extension"}, timeout=0.8)
+        j = r.json() if r.ok else {}
+        if j.get("app") in (APP_SHORT, "ChivetIDM", "MisterDM"):
+            return j.get("version") or "0"
+    except Exception:
+        pass
+    return None
+
+
+def take_over_from_old(port: int, old: str):
+    """A newer version was opened while an older one runs (e.g. started with Windows): close the old one."""
+    log_start(f"older version {old} running → closing it")
+    try:
+        requests.post(f"http://127.0.0.1:{port}/quit", headers={"X-MDM-Client": "extension"}, json={}, timeout=1)
+    except Exception:
+        pass
+    end = time.time() + 4
+    while time.time() < end and running_version(port) is not None:
+        time.sleep(0.4)
+    if running_version(port) is not None and platform.system() == "Windows":
+        # versions before 1.9.1 have no /quit: find the process that owns the port and end it
+        try:
+            flags = 0x08000000
+            out = subprocess.run(["netstat", "-ano", "-p", "TCP"], capture_output=True, text=True, creationflags=flags).stdout
+            pids = {line.split()[-1] for line in out.splitlines()
+                    if f"127.0.0.1:{port} " in line and "LISTENING" in line.upper()}
+            for pid in pids:
+                if pid.isdigit() and int(pid) != os.getpid():
+                    subprocess.run(["taskkill", "/F", "/PID", pid], capture_output=True, creationflags=flags)
+        except Exception as e:
+            log_start(f"could not close the old version: {e}")
+    end = time.time() + 6
+    while time.time() < end and running_version(port) is not None:
+        time.sleep(0.4)
 
 
 def another_instance_running(port: int) -> bool:
@@ -1554,7 +1861,9 @@ class AddDownloadDialog(QDialog):
             QMessageBox.warning(self, APP_NAME, "Please enter a valid http(s) link.")
             return
         mode = self.effective_mode()
-        if mode == "ytdlp" and not HAS_YTDLP:
+        if HONGGUO_HOST.search(_host(url)) and "/video/public/" not in url:
+            mode = "ytdlp"   # → the video window (built-in reader, no yt-dlp needed)
+        elif mode == "ytdlp" and not HAS_YTDLP:
             QMessageBox.warning(self, APP_NAME, "yt-dlp is not installed.\n\nRun:  pip install yt-dlp")
             return
         if mode == "ytdlp":
@@ -1716,6 +2025,9 @@ class VideoPageDialog(QDialog):
         self.list.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         self.list.setMinimumHeight(230)
         self.list.setAllColumnsShowFocus(True)
+        self.list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list.customContextMenuRequested.connect(self.list_menu)
+        QShortcut(QKeySequence(QKeySequence.StandardKey.Copy), self.list, activated=self.copy_list_text)
         lay.addWidget(self.list, 1)
 
         form = QFormLayout()
@@ -1747,6 +2059,13 @@ class VideoPageDialog(QDialog):
         helpers.setIcon(icon("options"))
         helpers.clicked.connect(lambda: HelpersDialog(self, self.settings).exec())
         brow.addWidget(helpers)
+        self.copy_btn = QPushButton("Copy error")
+        self.copy_btn.setIcon(icon("copy"))
+        self.copy_btn.clicked.connect(lambda: (QGuiApplication.clipboard().setText(self.last_error),
+                                               self.copy_btn.setText("Copied ✓")))
+        self.copy_btn.setVisible(False)
+        self.last_error = ""
+        brow.addWidget(self.copy_btn)
         brow.addStretch(1)
         self.now_btn = QPushButton("Download Now")
         self.now_btn.setObjectName("primary")
@@ -1783,8 +2102,32 @@ class VideoPageDialog(QDialog):
         self.list.clear()
         it = QTreeWidgetItem([text, ""])
         it.setForeground(0, QColor(color))
-        it.setFlags(Qt.ItemFlag.NoItemFlags)
+        it.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
+        it.setToolTip(0, text)
         self.list.addTopLevelItem(it)
+        self.last_error = text if color == C_RED else ""
+        self.copy_btn.setVisible(bool(self.last_error))
+
+    def offer_deno(self):
+        if QMessageBox.question(self, APP_NAME, "YouTube now needs a small helper program called Deno (≈45 MB, free, "
+                                "from github.com/denoland/deno).\n\nInstall it now?") == QMessageBox.StandardButton.Yes:
+            hd = HelpersDialog(self, self.settings)
+            hd.install_deno()
+            hd.exec()
+            if find_deno():
+                self.lookup()
+
+    def copy_list_text(self):
+        items = self.list.selectedItems() or [self.list.topLevelItem(i) for i in range(self.list.topLevelItemCount())]
+        text = "\n".join(i.text(0) + (("  " + i.text(1)) if i.text(1) else "") for i in items if i)
+        if text:
+            QGuiApplication.clipboard().setText(text)
+            self.site_lbl.setText("Copied ✓")
+
+    def list_menu(self, pos):
+        m = QMenu(self)
+        m.addAction(icon("copy"), "Copy", self.copy_list_text)
+        m.exec(self.list.viewport().mapToGlobal(pos))
 
     def update_dir(self, kind: str):
         if self.user_dir:
@@ -1824,7 +2167,8 @@ class VideoPageDialog(QDialog):
         if not looks_like_url(url):
             self.message_row("Enter a page address that starts with http:// or https://", C_AMBER)
             return
-        if not HAS_YTDLP:
+        builtin = is_hongguo(url, self.headers.get("Referer", ""))
+        if not HAS_YTDLP and not builtin:
             self.message_row("yt-dlp is not installed — open Helpers… or run:  pip install yt-dlp", C_RED)
             return
         self.seq += 1
@@ -1835,26 +2179,44 @@ class VideoPageDialog(QDialog):
         self.site_lbl.setText("Reading page…")
         self.meta_lbl.setText("")
         self.message_row("Looking up the video formats…")
-        headers = {"User-Agent": self.headers.get("User-Agent") or DEFAULT_UA}
-        for k in ("Cookie", "Referer"):
-            if self.headers.get(k):
-                headers[k] = self.headers[k]
+        url = clean_video_url(url)
+        if url != self.url_edit.text().strip():
+            self.url_edit.setText(url)
+        headers = ytdlp_headers(self.headers, url)
+        src_headers = dict(self.headers)
         bridge = self.bridge
+        hint = self.title_hint
 
         def work():
             res = {}
             info = None
             try:
-                opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
-                        "logger": _QuietLogger(), "http_headers": headers}
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    info = ydl.extract_info(url, download=False)
-                    if info and info.get("_type") == "playlist":
-                        entries = [e for e in (info.get("entries") or []) if e]
-                        info = entries[0] if entries else info
-                    res["info"] = ydl.sanitize_info(info)
+                if builtin:
+                    info = builtin_extract(url, src_headers, hint)
+                    res["info"] = info
+                    bridge.lookup_result.emit(seq, res)
+                    thumb = info.get("thumbnail")
+                    if thumb:
+                        r = requests.get(thumb, headers={"User-Agent": headers["User-Agent"]}, timeout=8)
+                        if r.ok and len(r.content) < 5_000_000:
+                            bridge.thumb_result.emit(seq, r.content)
+                    return
             except Exception as e:
-                res["error"] = re.sub(r"\x1b\[[0-9;]*m", "", str(e)).replace("ERROR: ", "")[:400]
+                if not res:
+                    res["error"] = clean_error(e)[:600]
+                    bridge.lookup_result.emit(seq, res)
+                return
+            try:
+                opts = {"quiet": True, "no_warnings": True, "skip_download": True, "noplaylist": True,
+                        "logger": _QuietLogger()}
+                ydl, info = ytdlp_extract(url, opts, src_headers)
+                if info and info.get("_type") == "playlist":
+                    entries = [e for e in (info.get("entries") or []) if e]
+                    info = entries[0] if entries else info
+                res["info"] = ydl.sanitize_info(info)
+            except Exception as e:
+                res["error"] = clean_error(e)[:600]
+                res["youtube_no_deno"] = is_youtube(url) and not find_deno()
             bridge.lookup_result.emit(seq, res)
             thumb = (info or {}).get("thumbnail")
             if thumb:
@@ -1874,20 +2236,33 @@ class VideoPageDialog(QDialog):
             self.lookup_btn.setEnabled(True)
             if res.get("error"):
                 self.site_lbl.setText("Could not read this page")
-                self.message_row(res["error"], C_RED)
-                tip = "Tip: log in to the site in Chrome, then try again — or update yt-dlp in Helpers…"
-                if "Unsupported URL" in res["error"] or not re.search(r"\d{6,}|[?&]v=|/shorts/|/status/|/p/|/reels?/\w", self.url_edit.text()):
+                yv = INSTALLER.ytdlp_version() if INSTALLER else ""
+                self.message_row(res["error"] + f"   [app {VERSION} · yt-dlp {yv} · Deno {'yes' if find_deno() else 'no'}]", C_RED)
+                tip = "Tip: press Helpers… → Update yt-dlp, then try again.   (Right-click → Copy, or the Copy error button)"
+                if res.get("youtube_no_deno"):
+                    tip = "YouTube needs Deno: press Helpers… → Install Deno, then Look up again."
+                    QTimer.singleShot(0, self.offer_deno)
+                elif "needs to be reloaded" in res["error"]:
+                    tip = "YouTube changed again: press Helpers… → Update yt-dlp, restart the app, then Look up again."
+                if is_hongguo(self.url_edit.text(), self.headers.get("Referer", "")):
+                    tip = ("红果短剧: open the episode in Chrome, let it play, then press the Chivet-kh button on the video "
+                           "(or ▾ → Download all episodes). Locked / VIP episodes cannot be downloaded.")
+                elif "Unsupported URL" in res["error"] or not re.search(r"\d{6,}|[?&]v=|/shorts/|/status/|/p/|/reels?/\w", self.url_edit.text()):
                     tip = ("This is a feed / list page, not one video. Open the video itself (click its date or "
                            "Share → Copy link) and paste that link here.")
                 hint = QTreeWidgetItem([tip, ""])
-                hint.setFlags(Qt.ItemFlag.NoItemFlags)
+                hint.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
                 hint.setForeground(0, QColor(C_MUTED))
                 self.list.addTopLevelItem(hint)
                 return
             info = res.get("info") or {}
             self.info = info
+            self.copy_btn.setVisible(False)
             key = (info.get("extractor_key") or info.get("extractor") or "").lower()
             self.site_lbl.setText(SITE_NAMES.get(key, info.get("extractor_key") or "Video"))
+            if info.get("_direct"):
+                eps = len(info.get("_episodes") or [])
+                self.site_lbl.setText("红果短剧 · direct MP4" + (f" · {eps} episode links on this page" if eps > 1 else ""))
             title = info.get("title") or self.title_hint or "video"
             if key == "generic" and self.title_hint and title.lower() in ("index", "master", "playlist", "video", "manifest"):
                 title = self.title_hint
@@ -1901,7 +2276,7 @@ class VideoPageDialog(QDialog):
                 meta.append(f"{info['width']}×{info['height']}")
             self.meta_lbl.setText("  ·  ".join(meta))
             has_ff = find_ffmpeg(self.settings) is not None
-            self.options = build_video_options(info, has_ff)
+            self.options = direct_options(info, has_ff) if info.get("_direct") else build_video_options(info, has_ff)
             self.list.clear()
             for opt in self.options:
                 if opt["size"]:
@@ -1979,6 +2354,20 @@ class VideoPageDialog(QDialog):
         if opt["kind"] == "subs" and not sub:
             QMessageBox.information(self, APP_NAME, "Choose a subtitle language first.")
             return
+        if opt.get("direct_url"):   # built-in reader: a plain file (video) or yt-dlp on that file (MP3)
+            hdr = {**self.headers, **((self.info or {}).get("http_headers") or {})}
+            title = (self.info or {}).get("title") or self.title_hint
+            self.result_data = {
+                "url": opt["direct_url"], "filename": name,
+                "save_dir": self.dir_edit.text().strip() or self.settings["download_dir"],
+                "kind": "http" if opt["kind"] == "video" else "ytdlp",
+                "category": "Video" if opt["kind"] == "video" else "Music",
+                "start_now": start_now, "auto_name": False, "headers": hdr, "title_hint": title,
+                "ytdlp_format": opt["selector"], "audio_format": "mp3" if opt["kind"] == "mp3" else "",
+                "audio_quality": opt.get("mp3q", ""), "size": opt.get("size") or -1,
+            }
+            self.accept()
+            return
         self.result_data = {
             "url": self.url_edit.text().strip(), "filename": name,
             "save_dir": self.dir_edit.text().strip() or self.settings["download_dir"],
@@ -2008,7 +2397,7 @@ class HelpersDialog(QDialog):
         super().__init__(parent)
         self.settings = settings
         self.setWindowTitle("Helpers")
-        self.setMinimumSize(560, 420)
+        self.setMinimumSize(700, 460)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(18, 16, 18, 16)
         g = QGroupBox("Video helpers")
@@ -2019,11 +2408,20 @@ class HelpersDialog(QDialog):
                 from yt_dlp.version import __version__ as ver
             except Exception:
                 ver = "installed"
-        self.ytdlp_lbl = QLabel(ver)
+        self.ytdlp_lbl = QLabel(ver + ("  (updated copy)" if HAS_YTDLP and "yt-dlp.pyz" in (getattr(yt_dlp, "__file__", "") or "") else ""))
         self.ff_lbl = QLabel()
         self.ff_lbl.setWordWrap(True)
+        self.deno_lbl = QLabel()
+        self.deno_lbl.setWordWrap(True)
+        try:
+            import yt_dlp_ejs  # noqa: F401
+            ejs = "✔ included"
+        except Exception:
+            ejs = "downloaded automatically when needed"
         f.addRow("yt-dlp", self.ytdlp_lbl)
         f.addRow("ffmpeg", self.ff_lbl)
+        f.addRow("Deno (YouTube)", self.deno_lbl)
+        f.addRow("YouTube solver", QLabel(ejs))
         lay.addWidget(g)
         row = QHBoxLayout()
         self.upd_btn = QPushButton("Update yt-dlp")
@@ -2032,7 +2430,11 @@ class HelpersDialog(QDialog):
         ch.setIcon(icon("folder"))
         get = QPushButton("Get ffmpeg")
         get.setIcon(icon("open"))
+        self.deno_btn = QPushButton("Install Deno")
+        self.deno_btn.setIcon(icon("all"))
+        self.deno_btn.setToolTip("Needed for YouTube (≈45 MB, from github.com/denoland/deno)")
         row.addWidget(self.upd_btn)
+        row.addWidget(self.deno_btn)
         row.addWidget(ch)
         row.addWidget(get)
         row.addStretch(1)
@@ -2048,15 +2450,26 @@ class HelpersDialog(QDialog):
         r2.addWidget(close)
         lay.addLayout(r2)
         self.upd_btn.clicked.connect(self.update_ytdlp)
+        self.deno_btn.clicked.connect(self.install_deno)
         ch.clicked.connect(self.choose_ffmpeg)
         get.clicked.connect(lambda: QDesktopServices.openUrl(QUrl(self.FFMPEG_PAGE)))
         self.proc = None
+        self._last = {}
+        INSTALLER.changed.connect(self.on_installer)
+        self.finished.connect(lambda *_: self._disconnect())
         self.refresh()
-        if getattr(sys, "frozen", False):
-            self.upd_btn.setEnabled(False)
-            self.upd_btn.setToolTip("Rebuild the .exe with the newest yt-dlp to update it")
+
+    def _disconnect(self):
+        try:
+            INSTALLER.changed.disconnect(self.on_installer)
+        except Exception:
+            pass
 
     def refresh(self):
+        deno = find_deno()
+        self.deno_lbl.setText(deno if deno else "not installed — YouTube downloads may fail. Press “Install Deno”.")
+        self.deno_lbl.setStyleSheet(f"color: {C_GREEN if deno else C_AMBER};")
+        self.deno_btn.setText("Reinstall Deno" if deno else "Install Deno")
         ff = find_ffmpeg(self.settings)
         self.ff_lbl.setText(ff if ff else "not found — video above 720p is limited and MP3 is unavailable")
         self.ff_lbl.setStyleSheet(f"color: {C_GREEN if ff else C_AMBER};")
@@ -2072,26 +2485,227 @@ class HelpersDialog(QDialog):
                 pass
             self.refresh()
 
-    def update_ytdlp(self):
-        from PyQt6.QtCore import QProcess
-        uv = shutil.which("uv") or str(Path.home() / ".local" / "bin" / ("uv.exe" if os.name == "nt" else "uv"))
-        in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
-        if os.path.isfile(uv) and in_venv:
-            prog, args = uv, ["pip", "install", "-U", "yt-dlp", "--python", sys.executable]
-        else:
-            prog, args = sys.executable, ["-m", "pip", "install", "-U", "yt-dlp"]
-        self.out.append(f"> {os.path.basename(prog)} {' '.join(args)}")
-        self.upd_btn.setEnabled(False)
-        self.proc = QProcess(self)
-        self.proc.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
-        self.proc.readyReadStandardOutput.connect(
-            lambda: self.out.append(bytes(self.proc.readAllStandardOutput()).decode("utf-8", "replace").rstrip()))
-        self.proc.finished.connect(self.update_done)
-        self.proc.start(prog, args)
+    # downloads run in a thread and report back through a signal: (0, text) progress, (1, text) done, (2, text) failed
+    def on_installer(self):
+        try:
+            for cid in ("deno", "ytdlp", "ffmpeg"):
+                st = INSTALLER.state[cid]
+                key = (cid, st["state"], st["pct"] // 10, st["msg"][:20])
+                if key != self._last.get(cid):
+                    self._last[cid] = key
+                    if st["state"] != "idle":
+                        self.out.append(f"{INSTALLER.NAMES[cid]}: {st['msg'] or st['state']}")
+            busy = any(INSTALLER.state[c]["state"] == "running" for c in ("deno", "ytdlp", "ffmpeg"))
+            self.upd_btn.setEnabled(INSTALLER.state["ytdlp"]["state"] != "running")
+            self.deno_btn.setEnabled(INSTALLER.state["deno"]["state"] != "running")
+            if not busy:
+                self.refresh()
+        except RuntimeError:
+            pass
 
-    def update_done(self, code, _status=None):
-        self.upd_btn.setEnabled(True)
-        self.out.append("✔ Done — restart Chivet-kh Download to use the new yt-dlp." if code == 0 else f"✖ Update failed (code {code}).")
+    def install_deno(self):
+        INSTALLER.start("deno")
+
+    def update_ytdlp(self):
+        INSTALLER.start("ytdlp")
+
+
+def _ver_tuple(v: str):
+    return tuple(int(x) for x in re.findall(r"\d+", v or "")[:4]) or (0,)
+
+
+def bundled_extension_version() -> str:
+    try:
+        return json.load(open(EXTENSION_DIR / "manifest.json", encoding="utf-8")).get("version", "")
+    except Exception:
+        return ""
+
+
+class Installer(QObject):
+    """One-click installs/updates used by Helpers and by the browser extension (/status, /install)."""
+    changed = pyqtSignal()
+    restart_wanted = pyqtSignal()
+    NAMES = {"app": "Chivet-kh Download", "ytdlp": "yt-dlp (video sites)", "deno": "Deno (needed for YouTube)",
+             "ffmpeg": "ffmpeg (1080p + MP3)"}
+
+    def __init__(self, settings: dict):
+        super().__init__()
+        self.settings = settings
+        self.state = {k: {"state": "idle", "pct": 0, "msg": ""} for k in self.NAMES}
+        self.latest = {"ytdlp": "", "app": "", "app_asset": "", "checked": 0.0}
+        self.restart_needed = False
+        self.busy_check = False
+
+    # ---------------- versions
+    def ytdlp_version(self) -> str:
+        try:
+            return yt_dlp.version.__version__ if HAS_YTDLP else ""
+        except Exception:
+            return ""
+
+    def check_latest(self, force=False):
+        if self.busy_check or (not force and time.time() - self.latest["checked"] < 6 * 3600):
+            return
+        self.busy_check = True
+
+        def work():
+            try:
+                h = {"User-Agent": DEFAULT_UA, "Accept": "application/vnd.github+json"}
+                r = requests.get("https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest", headers=h, timeout=10)
+                if r.ok:
+                    self.latest["ytdlp"] = r.json().get("tag_name", "")
+                r = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest", headers=h, timeout=10)
+                if r.ok:
+                    j = r.json()
+                    self.latest["app"] = (j.get("tag_name") or "").lstrip("v")
+                    asset = next((a for a in j.get("assets", []) if a.get("name", "").lower().endswith("win64.zip")), None)
+                    self.latest["app_asset"] = asset["browser_download_url"] if asset else ""
+                self.latest["checked"] = time.time()
+            except Exception:
+                pass
+            self.busy_check = False
+            self.changed.emit()
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def status(self) -> dict:
+        self.check_latest()
+        frozen = getattr(sys, "frozen", False)
+        yv, yl = self.ytdlp_version(), self.latest["ytdlp"]
+        al = self.latest["app"]
+        comps = []
+
+        def add(cid, installed, version, latest, need, action, why):
+            st = self.state[cid]
+            comps.append({"id": cid, "name": self.NAMES[cid], "installed": installed, "version": version,
+                          "latest": latest, "need": need and st["state"] not in ("running",), "action": action,
+                          "why": why, "state": st["state"], "pct": st["pct"], "msg": st["msg"]})
+
+        app_new = bool(al) and _ver_tuple(al) > _ver_tuple(VERSION)
+        add("app", True, VERSION, al, app_new, "update" if app_new else "",
+            "A new version is on GitHub" if app_new else "Up to date")
+        y_new = bool(yv and yl) and _ver_tuple(yl) > _ver_tuple(yv)
+        add("ytdlp", HAS_YTDLP, yv, yl, (not HAS_YTDLP) or y_new, "update" if HAS_YTDLP else "install",
+            "Newer yt-dlp fixes YouTube / Facebook changes" if y_new else ("Missing" if not HAS_YTDLP else "Up to date"))
+        deno = find_deno()
+        add("deno", bool(deno), "", "", not deno, "install" if not deno else "",
+            "YouTube downloads need it" if not deno else "Installed")
+        ff = find_ffmpeg(self.settings)
+        add("ffmpeg", bool(ff), "", "", not ff, "install" if not ff else "",
+            "Needed for 1080p and MP3" if not ff else "Installed")
+        return {"ok": True, "app": APP_SHORT, "version": VERSION, "frozen": frozen,
+                "extension_version": bundled_extension_version(), "restart_needed": self.restart_needed,
+                "components": comps, "needs": sum(1 for c in comps if c["need"]) + (1 if self.restart_needed else 0)}
+
+    # ---------------- installs
+    def _set(self, cid, state, pct=0, msg=""):
+        self.state[cid] = {"state": state, "pct": pct, "msg": msg}
+        self.changed.emit()
+
+    def _fetch(self, cid, url, dest: Path, unzip_member=None, unzip_all_to: Path = None):
+        tmp = Path(str(dest) + ".part")
+        TOOLS_DIR.mkdir(parents=True, exist_ok=True)
+        with requests.get(url, stream=True, timeout=(15, 60), headers={"User-Agent": DEFAULT_UA}) as r:
+            r.raise_for_status()
+            total = int(r.headers.get("Content-Length") or 0)
+            got, last = 0, 0
+            with open(tmp, "wb") as f:
+                for chunk in r.iter_content(256 * 1024):
+                    f.write(chunk)
+                    got += len(chunk)
+                    if total and got - last > total / 50:
+                        last = got
+                        self._set(cid, "running", got * 100 // total, f"Downloading… {human_size(got)} / {human_size(total)}")
+        self._set(cid, "running", 100, "Installing…")
+        import zipfile
+        if unzip_all_to:
+            if unzip_all_to.exists():
+                shutil.rmtree(unzip_all_to, ignore_errors=True)
+            with zipfile.ZipFile(tmp) as z:
+                z.extractall(unzip_all_to)
+            tmp.unlink()
+        elif unzip_member:
+            with zipfile.ZipFile(tmp) as z:
+                name = next(n for n in z.namelist() if n.replace("\\", "/").lower().endswith("/" + unzip_member) or n.lower() == unzip_member)
+                with z.open(name) as src, open(dest, "wb") as out:
+                    shutil.copyfileobj(src, out)
+            tmp.unlink()
+        else:
+            os.replace(tmp, dest)
+        if os.name != "nt" and dest.exists() and dest.is_file():
+            os.chmod(dest, 0o755)
+
+    def start(self, cid: str) -> bool:
+        if cid not in self.NAMES or self.state[cid]["state"] == "running":
+            return False
+        self._set(cid, "running", 0, "Starting…")
+        threading.Thread(target=self._run, args=(cid,), daemon=True).start()
+        return True
+
+    def _run(self, cid):
+        try:
+            getattr(self, "_install_" + cid)()
+        except Exception as e:
+            self._set(cid, "error", 0, str(e)[:200])
+
+    def _install_deno(self):
+        exe = "deno.exe" if os.name == "nt" else "deno"
+        asset = {"Windows": "deno-x86_64-pc-windows-msvc.zip", "Darwin": "deno-aarch64-apple-darwin.zip"}.get(
+            platform.system(), "deno-x86_64-unknown-linux-gnu.zip")
+        self._fetch("deno", f"https://github.com/denoland/deno/releases/latest/download/{asset}", TOOLS_DIR / exe,
+                    unzip_member=exe)
+        self._set("deno", "done", 100, "Installed ✓")
+
+    def _install_ffmpeg(self):
+        if platform.system() != "Windows":
+            raise RuntimeError("Install ffmpeg with your system's package manager")
+        self._fetch("ffmpeg", "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-win64-gpl.zip",
+                    TOOLS_DIR / "ffmpeg.exe", unzip_member="ffmpeg.exe")
+        _FFMPEG_AUTO.clear()
+        self._set("ffmpeg", "done", 100, "Installed ✓")
+
+    def _install_ytdlp(self):
+        if getattr(sys, "frozen", False):
+            self._fetch("ytdlp", "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp", YTDLP_OVERRIDE)
+        else:
+            uv = shutil.which("uv") or str(Path.home() / ".local" / "bin" / ("uv.exe" if os.name == "nt" else "uv"))
+            in_venv = sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+            cmd = ([uv, "pip", "install", "-U", "yt-dlp", "yt-dlp-ejs", "--python", sys.executable]
+                   if os.path.isfile(uv) and in_venv else [sys.executable, "-m", "pip", "install", "-U", "yt-dlp", "yt-dlp-ejs"])
+            self._set("ytdlp", "running", 50, "Installing with pip…")
+            flags = 0x08000000 if os.name == "nt" else 0   # CREATE_NO_WINDOW
+            r = subprocess.run(cmd, capture_output=True, text=True, creationflags=flags)
+            if r.returncode != 0:
+                raise RuntimeError((r.stderr or r.stdout).strip().splitlines()[-1][:200])
+        self.restart_needed = True
+        self._set("ytdlp", "done", 100, "Updated ✓ — restarting the app…")
+        self.restart_wanted.emit()
+
+    def _install_app(self):
+        if not getattr(sys, "frozen", False):
+            raise RuntimeError("Running from source: download the new code from GitHub")
+        if not self.latest["app_asset"]:
+            raise RuntimeError("No Windows zip found in the newest GitHub release")
+        target = TOOLS_DIR / "app_update"
+        self._fetch("app", self.latest["app_asset"], TOOLS_DIR / "app_update.zip", unzip_all_to=target)
+        src = next((Path(r) for r, _d, f in os.walk(target) if "ChivetKhDownload.exe" in f), None)
+        if not src:
+            raise RuntimeError("The downloaded zip has no ChivetKhDownload.exe")
+        app_dir = Path(sys.executable).resolve().parent
+        bat = TOOLS_DIR / "apply_update.bat"
+        pid = os.getpid()
+        bat.write_text("\r\n".join([
+            "@echo off",
+            ":wait",
+            f'tasklist /FI "PID eq {pid}" 2>nul | find "{pid}" >nul && (timeout /t 1 /nobreak >nul & goto wait)',
+            f'robocopy "{src}" "{app_dir}" /E /R:5 /W:1 /NFL /NDL /NJH /NJS /NP >nul',
+            f'start "" "{app_dir / "ChivetKhDownload.exe"}" --minimized',
+            f'rmdir /s /q "{target}"',
+            'del "%~f0"',
+        ]) + "\r\n", encoding="utf-8")
+        self.pending_bat = str(bat)
+        self._set("app", "done", 100, "Downloaded ✓ — updating and restarting…")
+        self.restart_wanted.emit()
 
 
 class SegmentBar(QWidget):
@@ -2717,9 +3331,12 @@ class LinksDialog(QDialog):
     """Paste many links (reels, videos, playlists, channels, pages) → every video inside them → download all."""
     WORKERS = 3
 
-    def __init__(self, main, links: list = None, cookies: dict = None, user_agent: str = "", source: str = ""):
+    def __init__(self, main, links: list = None, cookies: dict = None, user_agent: str = "", source: str = "",
+                 titles: dict = None, referer: str = ""):
         super().__init__(main)
         self.main = main
+        self.titles = dict(titles or {})   # link → name sent by the browser (e.g. "剧名 第3集")
+        self.referer = referer or ""
         self.cookies = dict(cookies or {})
         self.ua = user_agent or ""
         self.rows = []          # {url,title,duration,site,status,checked,group}
@@ -2791,6 +3408,8 @@ class LinksDialog(QDialog):
         for c, wdt in ((0, 360), (1, 70), (2, 90), (3, 150)):
             self.table.setColumnWidth(c, wdt)
         self.table.itemChanged.connect(self.on_item_changed)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.table_menu)
         lay.addWidget(self.table, 1)
 
         opt = QHBoxLayout()
@@ -2892,14 +3511,16 @@ class LinksDialog(QDialog):
             c = next((v for k, v in self.cookies.items() if k.endswith(dom)), "")
         if c:
             h["Cookie"] = c
+        if self.referer:
+            h["Referer"] = self.referer
         return h
 
     # ------------------------------------------------------------ lookup
     def find(self):
-        if not HAS_YTDLP:
+        links = self.parse_links()
+        if not HAS_YTDLP and any(not is_hongguo(l, self.referer) for l in links):
             QMessageBox.warning(self, APP_NAME, "yt-dlp is not installed.\n\nRun:  pip install yt-dlp")
             return
-        links = self.parse_links()
         if not links:
             QMessageBox.information(self, APP_NAME, "Paste at least one link that starts with http:// or https://")
             return
@@ -2933,14 +3554,23 @@ class LinksDialog(QDialog):
         self.find_btn.setText("Finding…")
 
     def expand(self, link: str, maxn: int) -> dict:
+        if is_hongguo(link, self.referer):
+            try:
+                info = builtin_extract(link, self.headers_for(link), self.titles.get(link, ""))
+            except Exception as e:
+                return {"link": link, "error": clean_error(e)[:300]}
+            entries = [{"url": link, "title": info.get("title") or link, "duration": 0, "direct": info}]
+            if HONGGUO_HOST.search(_host(link)):   # a series / episode page → its other episode pages
+                for ep in (info.get("_episodes") or [])[:maxn]:
+                    if ep != link:
+                        entries.append({"url": ep, "title": "Episode page", "duration": 0, "nested": True})
+            return {"link": link, "entries": entries, "playlist": False, "name": info.get("title") or ""}
         opts = {"quiet": True, "no_warnings": True, "skip_download": True, "extract_flat": "in_playlist",
-                "playlistend": maxn, "logger": _QuietLogger(), "http_headers": self.headers_for(link)}
+                "playlistend": maxn, "logger": _QuietLogger()}
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(link, download=False)
+            _ydl, info = ytdlp_extract(link, opts, self.headers_for(link))
         except Exception as e:
-            msg = re.sub(r"\x1b\[[0-9;]*m", "", str(e)).replace("ERROR: ", "")
-            return {"link": link, "error": msg[:200]}
+            return {"link": link, "error": clean_error(e)[:300]}
         if not info:
             return {"link": link, "error": "Nothing found"}
         entries = []
@@ -2990,12 +3620,19 @@ class LinksDialog(QDialog):
                                      "site": _site_of(e["url"]) if not e["url"].startswith(link) else _site_of(link),
                                      "status": f"From: {res['name'][:40]}" if res.get("playlist") else "Ready",
                                      "checked": True, "group": link, "pending": False})
+                    if e.get("direct"):
+                        d = e["direct"]
+                        new_rows[-1].update(direct=d, site="红果短剧", status="Ready · " + "/".join(
+                            f["format_id"] for f in d.get("formats") or []))
                 if not new_rows and not nested:
                     self.rows[idx].update(status="No videos found", checked=False, pending=False)
                 else:
                     self.rows[idx:idx + 1] = new_rows
                 if nested:   # e.g. a YouTube channel home → its Videos / Shorts tabs
-                    extra = "\n".join(e["url"] for e in nested if e.get("url"))
+                    have = set(self.parse_links()) | {r["url"] for r in self.rows}
+                    extra = "\n".join(e["url"] for e in nested if e.get("url") and e["url"] not in have)
+                    nested = nested if extra else []
+                if nested:
                     self.edit.setPlainText(self.edit.toPlainText().rstrip() + "\n" + extra)
                     QTimer.singleShot(0, self.find)
             if self.pending <= 0:
@@ -3033,6 +3670,17 @@ class LinksDialog(QDialog):
         if cell.column() == 0 and 0 <= cell.row() < len(self.rows):
             self.rows[cell.row()]["checked"] = cell.checkState() == Qt.CheckState.Checked
             self.update_count()
+
+    def table_menu(self, pos):
+        rows = sorted({i.row() for i in self.table.selectedIndexes()}) or [self.table.rowAt(pos.y())]
+        rows = [r for r in rows if 0 <= r < len(self.rows)]
+        if not rows:
+            return
+        m = QMenu(self)
+        m.addAction(icon("copy"), "Copy error / status",
+                    lambda: QGuiApplication.clipboard().setText("\n".join(self.rows[r]["status"] for r in rows)))
+        m.addAction(icon("copy"), "Copy link", lambda: QGuiApplication.clipboard().setText("\n".join(self.rows[r]["url"] for r in rows)))
+        m.exec(self.table.viewport().mapToGlobal(pos))
 
     def set_all(self, on: bool):
         for r in self.rows:
@@ -3131,6 +3779,14 @@ class OptionsDialog(QDialog):
         self.autostart_cb = QCheckBox("Start Chivet-kh Download with Windows (hidden in the tray)")
         self.autostart_cb.setChecked(settings.get("autostart", True))
         f2.addRow("", self.autostart_cb)
+        st = autostart_status()
+        self.autostart_lbl = QLabel(st)
+        self.autostart_lbl.setWordWrap(True)
+        self.autostart_lbl.setStyleSheet(f"color: {C_GREEN if st.startswith('✔') else C_AMBER}; font-size: 9pt;")
+        f2.addRow("Windows startup", self.autostart_lbl)
+        logb = QPushButton("Open startup log")
+        logb.clicked.connect(lambda: open_path(str(DATA_DIR / "startup.log")))
+        f2.addRow("", logb)
         self.tray = QCheckBox("Closing the window keeps the app running in the system tray")
         self.tray.setChecked(settings["close_to_tray"])
         f2.addRow("", self.tray)
@@ -3353,7 +4009,12 @@ class MainWindow(QMainWindow):
         self.bridge.browser_add.connect(self.on_browser_add)
         self.bridge.batch_add.connect(self.on_batch_add)
         self.bridge.links_add.connect(self.on_links_add)
+        self.bridge.quit_request.connect(self.quit_app)
         self.bridge.show_window.connect(self.bring_to_front)
+        global INSTALLER
+        INSTALLER = Installer(self.settings)
+        INSTALLER.restart_wanted.connect(self.restart_when_idle)
+        INSTALLER.check_latest()
         self.server = ApiServer(self.bridge)
         self.server_ok = self.server.start(self.settings["port"])
 
@@ -3707,7 +4368,8 @@ class MainWindow(QMainWindow):
                        from_browser: bool = False, size_hint: int = 0, quality: str = None, title_hint: str = ""):
         if not isinstance(url, str):
             url = ""
-        if url and HAS_YTDLP and is_video_site(url) and mode != "http":
+        if url and mode != "http" and ((HAS_YTDLP and is_video_site(url)) or
+                                       (HONGGUO_HOST.search(_host(url)) and "/video/public/" not in url)):
             return self.video_page_dialog(url, headers, title_hint, from_browser)
         dlg = AddDownloadDialog(self, self.settings, self.bridge, url, filename, headers, mode, from_browser,
                                 size_hint, quality, title_hint)
@@ -3833,7 +4495,7 @@ class MainWindow(QMainWindow):
         except (TypeError, ValueError):
             size_hint = 0
         if data.get("lookup") or (mode == "ytdlp" and self.settings.get("browser_confirm", True)):
-            if not HAS_YTDLP:
+            if not HAS_YTDLP and not is_hongguo(url, headers.get("Referer", "")):
                 self.bring_to_front()
                 QMessageBox.warning(self, APP_NAME, "yt-dlp is not installed.\n\nRun:  pip install yt-dlp")
                 return
@@ -3869,8 +4531,9 @@ class MainWindow(QMainWindow):
         dlg.raise_()
         dlg.activateWindow()
 
-    def links_dialog(self, links: list = None, cookies: dict = None, ua: str = "", source: str = ""):
-        dlg = LinksDialog(self, links, cookies, ua, source)
+    def links_dialog(self, links: list = None, cookies: dict = None, ua: str = "", source: str = "",
+                     titles: dict = None, referer: str = ""):
+        dlg = LinksDialog(self, links, cookies, ua, source, titles, referer)
         self.dialogs.append(dlg)
 
         def done(_c):
@@ -3884,16 +4547,45 @@ class MainWindow(QMainWindow):
         return dlg
 
     def on_links_add(self, data: dict):
-        links = [str(l.get("url") if isinstance(l, dict) else l) for l in data.get("links", [])]
-        links = [l for l in links if l.startswith(("http://", "https://"))]
+        links, titles = [], {}
+        for l in data.get("links", []):
+            u = str(l.get("url") if isinstance(l, dict) else l)
+            if u.startswith(("http://", "https://")) and u not in titles:
+                links.append(u)
+                titles[u] = str(l.get("text") or "")[:150] if isinstance(l, dict) else ""
         if not links:
             return
-        src = f"{len(links)} video links collected from: {data.get('title') or data.get('page') or 'the page'}"
-        self.links_dialog(links, data.get("cookies") or {}, str(data.get("userAgent") or ""), src)
+        what = "episodes" if data.get("episodes") else "video links"
+        src = f"{len(links)} {what} collected from: {data.get('title') or data.get('page') or 'the page'}"
+        if data.get("skipped"):
+            src += f"  ·  {data['skipped']} locked / VIP episodes skipped"
+        page = str(data.get("page") or "")
+        self.links_dialog(links, data.get("cookies") or {}, str(data.get("userAgent") or ""), src,
+                          titles if data.get("episodes") else {}, page if is_hongguo(page) else "")
 
     def add_links(self, rows: list, folder: str, quality: str, sub: str, sub_auto: bool, embed: bool,
                   start_now: bool, headers_for):
         for r in rows:
+            if r.get("direct"):   # built-in reader → a plain MP4 file (or MP3 made from it)
+                f = pick_direct(r["direct"], quality)
+                if not f:
+                    continue
+                hdr = {**headers_for(r["url"]), **(r["direct"].get("http_headers") or {})}
+                if quality == "audio":
+                    it = DownloadItem(url=f["url"], filename=r["title"][:150], save_dir=folder, kind="ytdlp",
+                                      category="Music", headers=hdr, auto_name=True, quality="audio",
+                                      title_hint=r["title"])
+                else:
+                    name = unique_name(folder, safe_filename(r["title"])[:150] + ".mp4")
+                    it = DownloadItem(url=f["url"], filename=name, save_dir=folder, kind="http", category="Video",
+                                      connections=int(self.settings["connections"]), headers=hdr, auto_name=False,
+                                      title_hint=r["title"])
+                    if f.get("filesize"):
+                        it.size = int(f["filesize"])
+                it.in_queue, it.status = True, "Queued"
+                self.items.append(it)
+                _ITEM_REGISTRY[it.id] = it
+                continue
             it = DownloadItem(url=r["url"], filename=r["title"][:150], save_dir=folder, kind="ytdlp",
                               category="Music" if quality == "audio" else "Video",
                               headers=headers_for(r["url"]), auto_name=True, quality=quality,
@@ -4069,6 +4761,34 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(1500, self.quit_app)
         elif action == "shutdown":
             self.shutdown_computer()
+
+    def restart_when_idle(self):
+        if self.tasks:   # wait for running downloads to finish
+            self.statusBar().showMessage("Will restart after the current downloads finish…", 8000)
+            QTimer.singleShot(15000, self.restart_when_idle)
+            return
+        QTimer.singleShot(1500, self.restart_app)
+
+    def restart_app(self):
+        bat = getattr(INSTALLER, "pending_bat", "")
+        self.quitting = True
+        self.shutdown()
+        try:
+            if bat and os.path.exists(bat):
+                subprocess.Popen(["cmd", "/c", bat], creationflags=0x08000000)
+            else:
+                if getattr(sys, "frozen", False):
+                    cmd = [sys.executable, "--minimized", "--restart"]
+                else:
+                    exe = sys.executable
+                    w = os.path.join(os.path.dirname(exe), "pythonw.exe")
+                    cmd = [w if os.path.exists(w) else exe, os.path.abspath(__file__), "--minimized", "--restart"]
+                flags = (0x00000008 | 0x00000200) if os.name == "nt" else 0   # DETACHED_PROCESS | NEW_PROCESS_GROUP
+                subprocess.Popen(cmd, creationflags=flags, close_fds=True,
+                                 start_new_session=(os.name != "nt"))
+        except Exception as e:
+            log_start(f"restart failed: {e}")
+        QApplication.instance().quit()
 
     def shutdown_computer(self):
         if True:  # Windows shows a 60 s warning; "shutdown /a" cancels it
@@ -4248,8 +4968,8 @@ class MainWindow(QMainWindow):
         it = self.selected_items()[0]
         if it.error:
             m.addSeparator()
-            err = QAction(icon("info", C_RED), "Error: " + it.error[:80], self)
-            err.setEnabled(False)
+            err = QAction(icon("copy", C_RED), "Copy error: " + it.error[:70], self)
+            err.triggered.connect(lambda _=False, t=it.error: QGuiApplication.clipboard().setText(t))
             m.addAction(err)
         m.exec(self.table.viewport().mapToGlobal(pos))
 
@@ -4357,8 +5077,18 @@ class MainWindow(QMainWindow):
 
 def main():
     settings = load_settings()
-    if another_instance_running(settings.get("port", DEFAULT_PORT)):
+    if "--restart" in sys.argv:   # the old copy is closing; wait for it to let go of the port
+        end = time.time() + 25
+        while time.time() < end and another_instance_running(settings.get("port", DEFAULT_PORT)):
+            time.sleep(0.5)
+    port = settings.get("port", DEFAULT_PORT)
+    old = running_version(port)
+    if old is not None and _ver_tuple(old) < _ver_tuple(VERSION):
+        take_over_from_old(port, old)
+    if another_instance_running(port):
+        log_start("already running → exit")
         return
+    log_start("start" + (" (background)" if started_in_background() else ""))
     if hasattr(Qt.HighDpiScaleFactorRoundingPolicy, "PassThrough"):
         QGuiApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication([a for a in sys.argv if not a.lower().startswith(PROTOCOL + ":")])
@@ -4370,7 +5100,24 @@ def main():
     register_protocol()
     set_autostart(settings.get("autostart", True))
     w = MainWindow()
-    if started_in_background() and w.tray:
+    if not w.server_ok:
+        log_start(f"port {settings.get('port')} busy: {w.server.error}")
+    if started_in_background():
+        # Right after Windows logs in, the taskbar tray may not exist yet → wait for it, stay hidden
+        if w.tray is None:
+            tries = {"n": 0}
+
+            def wait_tray():
+                tries["n"] += 1
+                if QSystemTrayIcon.isSystemTrayAvailable():
+                    w.build_tray()
+                    log_start("tray ready after %d s" % (tries["n"] * 2))
+                    return
+                if tries["n"] < 90:
+                    QTimer.singleShot(2000, wait_tray)
+                else:
+                    w.show()
+            QTimer.singleShot(2000, wait_tray)
         w.hide()
     else:
         w.show()

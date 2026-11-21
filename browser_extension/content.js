@@ -36,6 +36,8 @@
     { host: /(^|\.)pinterest\.[a-z.]+$/, strong: /\/pin\/\d+/, weak: null },
   ];
   const site = SITES.find(s => s.host.test(location.hostname));
+  // 红果短剧: plain MP4 files; switching episodes does not change the address, so read the playing file instead
+  const HG = /(^|\.)hongguoduanju\.com$/.test(location.hostname);
 
   let enabled = true, imagesOn = true;
   const setScale = v => { const k = Math.min(1.8, Math.max(0.6, (+v || 100) / 100)); host.style.setProperty("--k", String(k)); if (current) place(); };
@@ -422,9 +424,134 @@
   function fileNameFor(url, fallbackExt) {
     try {
       const last = decodeURIComponent(new URL(url).pathname.split("/").pop() || "");
-      if (/\.(mp4|webm|m4v|mov|mkv|flv|mp3|m4a|ogg|wav)$/i.test(last) && last.length > 5) return last;
+      if (/\.(mp4|webm|m4v|mov|mkv|flv|mp3|m4a|ogg|wav)$/i.test(last) && last.length > 5 &&
+          !/^(\d{3,4}p|\d+|index|video|master|play(list)?|media|file|source|default)\.\w+$/i.test(last)) return last;
     } catch (e) {}
     return cleanTitle().replace(/[\\/:*?"<>|]/g, "_") + "." + (fallbackExt || "mp4");
+  }
+
+  // ------------------------------------------------------------------ 红果短剧 (hongguoduanju.com)
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const epNumOf = el => {
+    const t = ((el.getAttribute && (el.getAttribute("aria-label") || el.getAttribute("title"))) || "").trim();
+    const m = /^第\s*(\d+)\s*集$/.exec(t) || /^第\s*(\d+)\s*集$/.exec((el.textContent || "").trim());
+    return m ? +m[1] : 0;
+  };
+  function hgEpisodeButtons() {
+    const out = [];
+    for (const el of document.querySelectorAll("button, [role=button], li, a")) {
+      if (el.closest("chivet-kh-button")) continue;
+      const n = epNumOf(el);
+      if (n && !out.some(o => o.n === n)) out.push({ n, el });
+    }
+    return out.sort((a, b) => a.n - b.n);
+  }
+  function hgRangeTabs() {
+    const out = [];
+    for (const el of document.querySelectorAll("div, span, li, button")) {
+      if (el.childElementCount) continue;
+      if (/^\d+\s*-\s*\d+$/.test((el.textContent || "").trim())) out.push(el);
+    }
+    return out;
+  }
+  const hgDrama = () => {
+    const h = document.querySelector("h1");
+    return ((h && h.textContent) || document.title.split(/\s+第\d+集|\s*\|/)[0] || "红果短剧").trim().slice(0, 80);
+  };
+  function hgEpisode() {
+    for (const el of document.querySelectorAll("[aria-pressed='true'], [aria-current], .active, .selected")) {
+      const n = epNumOf(el);
+      if (n) return n;
+    }
+    const crumbs = document.querySelectorAll("nav li, [aria-label='面包屑'] li");
+    for (let i = crumbs.length - 1; i >= 0; i--) {
+      const m = /第\s*(\d+)\s*集/.exec(crumbs[i].textContent || "");
+      if (m) return +m[1];
+    }
+    const m = /第\s*(\d+)\s*集/.exec(document.title);
+    return m ? +m[1] : 0;
+  }
+  const hgName = n => { n = n || hgEpisode(); return hgDrama() + (n ? ` 第${n}集` : ""); };
+
+  // The file the player is showing now (its <video> src, or the newest MP4 the tab loaded after `since`)
+  async function hgPlayingFile(since) {
+    const v = biggestVideo();
+    const src = v ? directSrc(v) : "";
+    if (src && !/\.(m3u8|mpd)(\?|$)/i.test(src)) return src;
+    const files = (await tabStreams()).filter(s => s.kind === "file" && (!since || s.ts >= since));
+    return files.length ? files[0].url : "";
+  }
+
+  // Click through the episode list and note each episode's file. Locked / VIP episodes do not start a new file
+  // and are skipped — nothing is unlocked. Stops after 3 locked episodes in a row.
+  let hgBusy = false;
+  async function hgCollectEpisodes(report) {
+    if (hgBusy) return { links: [], skipped: 0, busy: true };
+    hgBusy = true;
+    const links = [], tried = new Set();
+    let skipped = 0, misses = 0, prev = await hgPlayingFile(0);
+    const vid = biggestVideo(), wasMuted = vid ? vid.muted : false;
+    try {
+      const cur = hgEpisode();
+      if (prev && cur) { links.push({ url: prev, text: hgName(cur) }); tried.add(cur); }
+      const tabs = hgRangeTabs();
+      outer:
+      for (const tab of (tabs.length ? tabs : [null])) {
+        if (tab) { tab.click(); await sleep(700); }
+        for (const { n, el } of hgEpisodeButtons()) {
+          if (tried.has(n)) continue;
+          tried.add(n);
+          report && report(n, links.length);
+          const t0 = Date.now();
+          el.click();
+          let url = "";
+          for (let k = 0; k < 16 && !url; k++) {
+            await sleep(500);
+            const v = biggestVideo();
+            if (v) v.muted = true;
+            const f = await hgPlayingFile(t0);
+            if (f && f !== prev && !links.some(l => l.url === f)) url = f;
+          }
+          if (url) { links.push({ url, text: hgName(n) }); prev = url; misses = 0; }
+          else {
+            skipped++; misses++;
+            document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
+            if (misses >= 3) break outer;
+          }
+        }
+      }
+    } finally {
+      hgBusy = false;
+      const v = biggestVideo();
+      if (v) { v.muted = wasMuted; try { v.pause(); } catch (e) {} }
+    }
+    return { links, skipped };
+  }
+
+  async function hgDownloadAll() {
+    closePanel();
+    let r = null;
+    try {
+      r = await chrome.runtime.sendMessage({ type: "ping" });
+      if (!(r && r.ok)) launchApp();   // still inside the click → Chrome lets us open the app
+    } catch (e) { setState("err", "Reload this page (F5)", 4000); return; }
+    setState("", "Reading episodes…", 0);
+    const res = await hgCollectEpisodes((n, got) => {
+      setState("", `Episode ${n} · ${got} found…`, 0);
+      showToast(`Chivet-kh: reading episode ${n} · ${got} found`, "", 0);
+    });
+    if (!res.links.length) { setState("err", "No free episode found", 4000); showToast("No free episode found", "err", 4000); return; }
+    try {
+      r = await chrome.runtime.sendMessage({ type: "episodes", page: location.href, title: hgDrama(), ...res });
+    } catch (e) { r = null; }
+    if (r && r.ok) {
+      setState("ok", `✓ ${res.links.length} episodes sent`, 3000);
+      showToast(`✓ ${res.links.length} episodes sent to Chivet-kh` + (res.skipped ? ` · ${res.skipped} locked / VIP skipped` : ""), "ok", 6000);
+    } else {
+      const t = r && r.reason === "offline" ? "Open Chivet-kh app first" : "Not accepted";
+      setState("err", t, 4000);
+      showToast(t, "err", 5000);
+    }
   }
 
   const fmtSize = n => !n ? "" : n < 1048576 ? (n / 1024).toFixed(0) + " KB" : n < 1073741824 ? (n / 1048576).toFixed(1) + " MB" : (n / 1073741824).toFixed(2) + " GB";
@@ -452,16 +579,34 @@
     if (ms) stateTimer = setTimeout(() => { resetState(); place(); }, ms);
   }
 
+  // Open the desktop app through its chivetkh:// link. This runs inside the user's click, which Chrome
+  // requires before it lets a page open an app on the computer.
+  function launchApp() {
+    try {
+      const a = document.createElement("a");
+      a.href = "chivetkh://start";
+      a.style.display = "none";
+      (document.body || document.documentElement).appendChild(a);
+      a.click();
+      setTimeout(() => a.remove(), 1000);
+    } catch (e) {}
+  }
+
   async function send(payload) {
     closePanel();
     setState("", payload.lookup ? "Opening Chivet-kh…" : "Sending…", 0);
-    const slow = setTimeout(() => setState("", "Starting Chivet-kh app…", 0), 1500);
+    const msg = { type: "send", referrer: location.href, title: cleanTitle(), noLaunch: true, ...payload };
     let r = null;
     try {
-      r = await chrome.runtime.sendMessage({ type: "send", referrer: location.href, title: cleanTitle(), ...payload });
-      clearTimeout(slow);
+      r = await chrome.runtime.sendMessage(msg);
+      if (r && r.reason === "offline" && r.autoLaunch !== false) {
+        setState("", "Starting Chivet-kh app…", 0);
+        showToast("Starting the app… if Chrome asks “Open Chivet-kh Download?”, tick Always allow → Open", "", 9000);
+        launchApp();
+        const w = await chrome.runtime.sendMessage({ type: "waitApp", ms: 30000 });
+        if (w && w.ok) r = await chrome.runtime.sendMessage(msg);
+      }
     } catch (e) {
-      clearTimeout(slow);
       setState("err", "Reload this page (F5)", 4000);
       return;
     }
@@ -495,6 +640,10 @@
   async function downloadDefault(v) {
     if (currentKind === "image" && v === current) return downloadImage(currentImg);
     const src = directSrc(v);
+    if (HG) {
+      const file = await hgPlayingFile(0);
+      return send({ url: file || location.href, mode: "ytdlp", lookup: true, title: hgName() });
+    }
     if (site) return send({ url: await pageUrlFor(v), mode: "ytdlp", lookup: true });
     if (src && !/\.(m3u8|mpd)(\?|$)/i.test(src)) return send({ url: src, mode: "http", filename: fileNameFor(src) });
     if (src) return send({ url: src, mode: "ytdlp", lookup: true });
@@ -543,8 +692,10 @@
       placePanel();
       return;
     }
-    addItem("⬇", "Download this video…", "", () => downloadDefault(v));
-    if (site) {
+    addItem("⬇", HG ? "Download this episode…" : "Download this video…", "", () => downloadDefault(v));
+    if (HG) {
+      addItem("▶▶", "Download all free episodes…", "", hgDownloadAll);
+    } else if (site) {
       addItem("♪", "Audio only (MP3)…", "", async () => send({ url: await pageUrlFor(v), mode: "ytdlp", lookup: true }));
     } else {
       const src = directSrc(v);
@@ -593,6 +744,10 @@
   const onMsg = (msg, _s, reply) => {
     if (msg && msg.type === "mdm-status") {
       reply({ ok: true, frame: location.href, videos: allVideos().length, enabled });
+    } else if (msg && msg.type === "mdm-hg-episodes" && HG && window === window.top) {
+      hgCollectEpisodes((n, got) => showToast(`Chivet-kh: episode ${n} · ${got} found…`, "", 0))
+        .then(res => { showToast(`Chivet-kh: ${res.links.length} episodes found`, "ok", 4000); reply({ ...res, title: hgDrama() }); });
+      return true;
     }
   };
   try {
